@@ -1,20 +1,302 @@
-import io
-import streamlit as st
-import pandas as pd
+import sqlite3
+from datetime import datetime
+from io import StringIO
 import numpy as np
+import pandas as pd
+import streamlit as st
 import matplotlib.pyplot as plt
 
-# -------------------------
-# Page
-st.set_page_config(page_title="InventoryAI", page_icon="📦", layout="wide")
-st.title("📦 InventoryAI")
-st.caption("Upload sales CSV → Forecast demand → Reorder suggestions (SaaS-ready MVP)")
+# -----------------------
+# Page config
+# -----------------------
+st.set_page_config(page_title="InventoryAI - Weekly CSV MVP", layout="wide")
+st.title("📦 InventoryAI — Weekly CSV Inventory & Demand Forecasting (MVP)")
 
-# -------------------------
-# Helpers
+# -----------------------
+# DB helpers (SQLite)
+# -----------------------
+DB_PATH = "inventory_ai.sqlite"
 
-@st.cache_data
-def generate_sample_data(num_skus: int = 10, days: int = 365) -> pd.DataFrame:
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # SALES: daily totals by Date+SKU (unique)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sales (
+            date TEXT NOT NULL,
+            sku TEXT NOT NULL,
+            quantity REAL NOT NULL,
+            stock REAL NOT NULL,
+            PRIMARY KEY (date, sku)
+        )
+        """
+    )
+
+    # PRODUCTS: optional catalog
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS products (
+            sku TEXT PRIMARY KEY,
+            product_name TEXT,
+            category TEXT,
+            lead_time_override INTEGER,
+            days_to_cover_override INTEGER,
+            service_level_override INTEGER,
+            min_stock_override REAL
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def upsert_sales(df: pd.DataFrame) -> int:
+    """Insert/replace sales rows; returns rows upserted."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    rows = df[["Date", "SKU", "Quantity", "Stock"]].copy()
+    rows["Date"] = rows["Date"].dt.strftime("%Y-%m-%d")
+    rows["SKU"] = rows["SKU"].astype(str).str.strip()
+
+    payload = list(rows.itertuples(index=False, name=None))
+
+    cur.executemany(
+        """
+        INSERT OR REPLACE INTO sales (date, sku, quantity, stock)
+        VALUES (?, ?, ?, ?)
+        """,
+        payload,
+    )
+    conn.commit()
+    conn.close()
+    return len(payload)
+
+
+def upsert_products(df: pd.DataFrame) -> int:
+    """Insert/replace products rows; returns rows upserted."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Ensure required column
+    df = df.copy()
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+
+    # Normalize optional columns
+    def col_or_none(c):
+        return df[c] if c in df.columns else None
+
+    payload = []
+    for _, r in df.iterrows():
+        payload.append(
+            (
+                r["SKU"],
+                r.get("ProductName", None),
+                r.get("Category", None),
+                int(r["LeadTime"]) if "LeadTime" in df.columns and pd.notna(r["LeadTime"]) else None,
+                int(r["DaysToCover"]) if "DaysToCover" in df.columns and pd.notna(r["DaysToCover"]) else None,
+                int(r["ServiceLevel"]) if "ServiceLevel" in df.columns and pd.notna(r["ServiceLevel"]) else None,
+                float(r["MinStock"]) if "MinStock" in df.columns and pd.notna(r["MinStock"]) else None,
+            )
+        )
+
+    cur.executemany(
+        """
+        INSERT OR REPLACE INTO products
+        (sku, product_name, category, lead_time_override, days_to_cover_override, service_level_override, min_stock_override)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        payload,
+    )
+    conn.commit()
+    conn.close()
+    return len(payload)
+
+
+def load_sales() -> pd.DataFrame:
+    conn = get_conn()
+    df = pd.read_sql_query("SELECT date as Date, sku as SKU, quantity as Quantity, stock as Stock FROM sales", conn)
+    conn.close()
+    if df.empty:
+        return df
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0.0)
+    df["Stock"] = pd.to_numeric(df["Stock"], errors="coerce").fillna(0.0)
+    df = df.sort_values(["SKU", "Date"]).reset_index(drop=True)
+    return df
+
+
+def load_products() -> pd.DataFrame:
+    conn = get_conn()
+    df = pd.read_sql_query(
+        """
+        SELECT
+            sku as SKU,
+            product_name as ProductName,
+            category as Category,
+            lead_time_override as LeadTime,
+            days_to_cover_override as DaysToCover,
+            service_level_override as ServiceLevel,
+            min_stock_override as MinStock
+        FROM products
+        """,
+        conn,
+    )
+    conn.close()
+    if df.empty:
+        return df
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    return df
+
+
+def reset_db(confirm: bool):
+    if not confirm:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sales")
+    cur.execute("DELETE FROM products")
+    conn.commit()
+    conn.close()
+
+
+# -----------------------
+# Validation helpers
+# -----------------------
+def validate_sales(df: pd.DataFrame) -> pd.DataFrame:
+    required_cols = {"Date", "SKU", "Quantity", "Stock"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        st.error(f"❌ SALES CSV λείπουν στήλες: {', '.join(sorted(missing))}")
+        st.info("✅ Απαιτούνται ακριβώς: Date, SKU, Quantity, Stock")
+        st.stop()
+
+    df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    if df["Date"].isna().any():
+        st.error("❌ Η στήλη Date έχει τιμές που δεν αναγνωρίζονται ως ημερομηνία.")
+        st.info("Παράδειγμα: 2026-03-04")
+        st.stop()
+
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0.0)
+    df["Stock"] = pd.to_numeric(df["Stock"], errors="coerce").fillna(0.0)
+
+    # Daily totals mode: enforce unique Date+SKU by summing Quantity and taking last Stock (max date ties not needed)
+    # If duplicates exist in the upload, we consolidate within the upload.
+    df = df.sort_values(["SKU", "Date"]).reset_index(drop=True)
+    df = (
+        df.groupby(["Date", "SKU"], as_index=False)
+        .agg({"Quantity": "sum", "Stock": "last"})
+    )
+
+    return df
+
+
+def validate_products(df: pd.DataFrame) -> pd.DataFrame:
+    if "SKU" not in df.columns:
+        st.error("❌ PRODUCTS CSV πρέπει να έχει στήλη SKU.")
+        st.stop()
+
+    df = df.copy()
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+
+    # Optional columns normalization (if present)
+    rename_map = {}
+    # allow common variants
+    for col in df.columns:
+        c = col.strip()
+        rename_map[col] = c
+    df = df.rename(columns=rename_map)
+
+    # expected optional names: ProductName, Category, LeadTime, DaysToCover, ServiceLevel, MinStock
+    return df
+
+
+def z_from_service_level(sl: int) -> float:
+    # common approximations
+    z_table = {80: 0.84, 85: 1.04, 90: 1.28, 95: 1.65, 97: 1.88, 98: 2.05, 99: 2.33}
+    return z_table.get(int(sl), 1.65)
+
+
+def template_sales_csv() -> bytes:
+    sample = pd.DataFrame(
+        [
+            ["2026-03-01", "SKU001", 5, 120],
+            ["2026-03-01", "SKU002", 2, 80],
+            ["2026-03-02", "SKU001", 4, 118],
+        ],
+        columns=["Date", "SKU", "Quantity", "Stock"],
+    )
+    return sample.to_csv(index=False).encode("utf-8")
+
+
+def template_products_csv() -> bytes:
+    sample = pd.DataFrame(
+        [
+            ["SKU001", "Product A", "Category 1", 7, 14, 95, 0],
+            ["SKU002", "Product B", "Category 2", "", "", "", ""],
+        ],
+        columns=["SKU", "ProductName", "Category", "LeadTime", "DaysToCover", "ServiceLevel", "MinStock"],
+    )
+    return sample.to_csv(index=False).encode("utf-8")
+
+
+# -----------------------
+# Init DB
+# -----------------------
+init_db()
+
+# -----------------------
+# Sidebar - Global Defaults + Uploads
+# -----------------------
+st.sidebar.header("⚙️ Global defaults")
+
+use_demo = st.sidebar.checkbox("Use demo sample data", value=False)
+
+default_lead_time = st.sidebar.number_input("Default Lead Time (days)", min_value=1, value=7)
+default_service_level = st.sidebar.slider("Default Service Level (%)", min_value=80, max_value=99, value=95)
+default_days_to_cover = st.sidebar.number_input("Default Days to Cover", min_value=1, value=14)
+default_min_stock = st.sidebar.number_input("Default Min Stock (optional rule)", min_value=0.0, value=0.0)
+
+st.sidebar.divider()
+st.sidebar.subheader("📤 Uploads")
+
+sales_file = st.sidebar.file_uploader("Upload SALES CSV (weekly)", type="csv")
+products_file = st.sidebar.file_uploader("Upload PRODUCTS CSV (optional)", type="csv")
+
+col_u1, col_u2 = st.sidebar.columns(2)
+do_upload = col_u1.button("✅ Apply upload")
+do_reset = col_u2.button("🧨 Reset all data")
+
+if do_reset:
+    st.sidebar.warning("⚠️ Αυτό θα σβήσει ΟΛΑ τα δεδομένα (sales + products).")
+    confirm = st.sidebar.checkbox("Confirm reset")
+    if confirm:
+        reset_db(True)
+        st.sidebar.success("✅ Reset completed. Refresh the page.")
+        st.stop()
+
+# -----------------------
+# Tabs
+# -----------------------
+tab_products, tab_forecast, tab_help = st.tabs(["📁 Products", "📈 Forecast", "❓ Help"])
+
+# -----------------------
+# Demo data (optional)
+# -----------------------
+def generate_demo_sales(num_skus=10, days=365) -> pd.DataFrame:
     np.random.seed(42)
     skus = [f"SKU{i:03}" for i in range(1, num_skus + 1)]
     dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=days, freq="D")
@@ -27,387 +309,289 @@ def generate_sample_data(num_skus: int = 10, days: int = 365) -> pd.DataFrame:
         for d in dates:
             qty = np.random.poisson(lam=base_lam)
             replen = np.random.randint(0, 15)
-
             stock = stock - qty + replen
             if stock < 0:
                 stock = np.random.randint(50, 250)
+            rows.append([d, sku, float(qty), float(stock)])
 
-            rows.append([d.strftime("%Y-%m-%d"), sku, int(qty), int(stock)])
-
-    return pd.DataFrame(rows, columns=["Date", "SKU", "Quantity", "Stock"])
-
-
-def validate_sales(df: pd.DataFrame) -> pd.DataFrame:
-    required_cols = {"Date", "SKU", "Quantity", "Stock"}
-    missing = required_cols - set(df.columns)
-    if missing:
-        st.error(f"❌ SALES CSV: λείπουν στήλες: {', '.join(sorted(missing))}")
-        st.info("✅ Απαιτούνται: Date, SKU, Quantity, Stock")
-        st.stop()
-
-    df = df.copy()
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    if df["Date"].isna().any():
-        st.error("❌ SALES CSV: η στήλη Date έχει λάθος μορφή ημερομηνίας.")
-        st.info("Παράδειγμα: 2026-03-04")
-        st.stop()
-
-    df["SKU"] = df["SKU"].astype(str).str.strip()
-    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
-    df["Stock"] = pd.to_numeric(df["Stock"], errors="coerce").fillna(0)
-
-    # sort for correct last stock
-    df = df.sort_values(["SKU", "Date"]).reset_index(drop=True)
+    df = pd.DataFrame(rows, columns=["Date", "SKU", "Quantity", "Stock"])
+    df = df.groupby(["Date", "SKU"], as_index=False).agg({"Quantity": "sum", "Stock": "last"})
+    df["Date"] = pd.to_datetime(df["Date"])
     return df
 
 
-def validate_products(df: pd.DataFrame) -> pd.DataFrame:
-    # required SKU only; others optional
-    if "SKU" not in df.columns:
-        st.warning("⚠️ PRODUCTS CSV δεν έχει στήλη 'SKU'. Θα αγνοηθεί.")
-        return None
+def generate_demo_products() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "SKU": [f"SKU{i:03}" for i in range(1, 11)],
+            "ProductName": [f"Demo Product {i}" for i in range(1, 11)],
+            "Category": ["Demo"] * 10,
+            "LeadTime": [None] * 10,
+            "DaysToCover": [None] * 10,
+            "ServiceLevel": [None] * 10,
+            "MinStock": [None] * 10,
+        }
+    )
 
-    df = df.copy()
-    df["SKU"] = df["SKU"].astype(str).str.strip()
-
-    # normalize optional fields if present
-    for col in ["ProductName", "Category"]:
-        if col in df.columns:
-            df[col] = df[col].astype(str).fillna("").str.strip()
-
-    # per-SKU params (optional)
-    num_cols = ["LeadTime", "DaysToCover", "MinStock", "ServiceLevel"]
-    for col in num_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df
-
-
-def z_from_service(service_level: float) -> float:
-    z_table = {80: 0.84, 85: 1.04, 90: 1.28, 95: 1.65, 99: 2.33}
-    # service_level can be float; we map to nearest key
-    keys = np.array(list(z_table.keys()))
-    nearest = int(keys[np.argmin(np.abs(keys - service_level))])
-    return float(z_table[nearest])
-
-
-def safe_int(x, default=None):
-    try:
-        if pd.isna(x):
-            return default
-        return int(x)
-    except Exception:
-        return default
-
-
-def safe_float(x, default=None):
-    try:
-        if pd.isna(x):
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-
-# -------------------------
-# Sidebar - Global defaults
-st.sidebar.header("⚙️ Global defaults")
-
-use_sample = st.sidebar.checkbox("✅ Use demo sample data", value=True)
-
-default_lead_time = st.sidebar.number_input("Default Lead Time (days)", min_value=1, value=7)
-default_service_level = st.sidebar.slider("Default Service Level (%)", min_value=80, max_value=99, value=95)
-default_days_to_cover = st.sidebar.number_input("Default Days to Cover", min_value=1, value=14)
-default_min_stock = st.sidebar.number_input("Default Min Stock (optional rule)", min_value=0, value=0)
-
-st.sidebar.divider()
-st.sidebar.subheader("📁 Uploads")
-
-uploaded_sales = None
-uploaded_products = None
-if not use_sample:
-    uploaded_sales = st.sidebar.file_uploader("Upload SALES CSV", type="csv")
-    uploaded_products = st.sidebar.file_uploader("Upload PRODUCTS CSV (optional)", type="csv")
-
-# -------------------------
-# Load data
-products_df = None
-
-if use_sample:
-    st.info("ℹ️ Demo mode: using sample data (10 SKUs / 365 days).")
-    sales_df = generate_sample_data(num_skus=10, days=365)
-    sales_df = validate_sales(sales_df)
-else:
-    if uploaded_sales is None:
-        st.warning("⬅️ Ανέβασε SALES CSV για να ξεκινήσεις.")
-        st.stop()
-
-    sales_df = pd.read_csv(uploaded_sales)
-    sales_df = validate_sales(sales_df)
-    st.success("✅ SALES CSV loaded!")
-
-    if uploaded_products is not None:
-        products_df = pd.read_csv(uploaded_products)
-        products_df = validate_products(products_df)
-        if products_df is not None:
-            st.success("✅ PRODUCTS CSV loaded!")
-
-# -------------------------
-# Session-state product catalog (manual manager)
-if "catalog" not in st.session_state:
-    # seed from products CSV if exists; else empty
-    if products_df is not None:
-        st.session_state["catalog"] = products_df.copy()
+# -----------------------
+# Handle upload action
+# -----------------------
+if do_upload:
+    if use_demo:
+        demo_sales = generate_demo_sales()
+        upsert_sales(demo_sales)
+        demo_products = generate_demo_products()
+        upsert_products(demo_products)
+        st.success("✅ Demo data loaded into database!")
     else:
-        st.session_state["catalog"] = pd.DataFrame(
-            columns=["SKU", "ProductName", "Category", "LeadTime", "DaysToCover", "ServiceLevel", "MinStock"]
+        if sales_file is None:
+            st.error("❌ Πρέπει να ανεβάσεις SALES CSV.")
+            st.stop()
+
+        sales_df = pd.read_csv(sales_file)
+        sales_df = validate_sales(sales_df)
+        n_sales = upsert_sales(sales_df)
+
+        if products_file is not None:
+            prod_df = pd.read_csv(products_file)
+            prod_df = validate_products(prod_df)
+            n_prod = upsert_products(prod_df)
+            st.success(f"✅ SALES uploaded: {n_sales} rows | PRODUCTS uploaded: {n_prod} rows")
+        else:
+            st.success(f"✅ SALES uploaded: {n_sales} rows")
+    st.info("ℹ️ Αν δεν βλέπεις αλλαγές, πάτα Refresh (F5).")
+
+# -----------------------
+# Load from DB
+# -----------------------
+sales = load_sales()
+products = load_products()
+
+# -----------------------
+# PRODUCTS tab
+# -----------------------
+with tab_products:
+    st.subheader("🗂️ Product catalog (optional)")
+    st.caption("Μπορείς να ανεβάσεις PRODUCTS CSV ή να δουλέψεις χωρίς αυτό. Χρήσιμο για ονομασίες/κατηγορίες και per-SKU overrides.")
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.download_button(
+            "⬇️ Download SALES template.csv",
+            data=template_sales_csv(),
+            file_name="sales_template.csv",
+            mime="text/csv",
+        )
+    with c2:
+        st.download_button(
+            "⬇️ Download PRODUCTS template.csv",
+            data=template_products_csv(),
+            file_name="products_template.csv",
+            mime="text/csv",
         )
 
-catalog = st.session_state["catalog"]
+    st.divider()
 
-# -------------------------
-# Navigation
-tab_products, tab_forecast, tab_help = st.tabs(["📦 Products", "📊 Forecast", "❓ Help"])
+    if products.empty:
+        st.warning("Δεν υπάρχει PRODUCTS catalog ακόμη. (Προαιρετικό)")
+    else:
+        st.dataframe(products, use_container_width=True)
 
-# =========================
-# TAB: PRODUCTS
-with tab_products:
-    st.subheader("📦 Products Manager (optional)")
-    st.caption("Here you can keep a simple product catalog + per-SKU parameters. "
-               "You can also upload a PRODUCTS CSV, and it will prefill this table.")
+    st.divider()
+    st.subheader("➕ Quick add / update one product (optional)")
 
-    with st.expander("➕ Add / Update a product", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        sku_in = c1.text_input("SKU (required)", value="")
-        name_in = c2.text_input("ProductName (optional)", value="")
-        cat_in = c3.text_input("Category (optional)", value="")
+    with st.expander("Add / Update a product"):
+        p1, p2, p3 = st.columns([1, 2, 2])
+        sku_in = p1.text_input("SKU (required)")
+        name_in = p2.text_input("ProductName (optional)")
+        cat_in = p3.text_input("Category (optional)")
 
-        c4, c5, c6, c7 = st.columns(4)
-        lead_in = c4.number_input("LeadTime override (days)", min_value=0, value=0)
-        cover_in = c5.number_input("DaysToCover override", min_value=0, value=0)
-        sl_in = c6.selectbox("ServiceLevel override (%)", options=[0, 80, 85, 90, 95, 99], index=0)
-        min_in = c7.number_input("MinStock override", min_value=0, value=0)
+        o1, o2, o3, o4 = st.columns(4)
+        lt = o1.number_input("LeadTime override (days)", min_value=0, value=0)
+        dc = o2.number_input("DaysToCover override", min_value=0, value=0)
+        sl = o3.number_input("ServiceLevel override (%)", min_value=0, max_value=99, value=0)
+        ms = o4.number_input("MinStock override", min_value=0.0, value=0.0)
 
-        colA, colB = st.columns(2)
-        if colA.button("💾 Save product"):
-            sku_clean = sku_in.strip()
-            if not sku_clean:
+        if st.button("💾 Save product"):
+            if not sku_in.strip():
                 st.error("SKU είναι υποχρεωτικό.")
             else:
-                row = {
-                    "SKU": sku_clean,
-                    "ProductName": name_in.strip(),
-                    "Category": cat_in.strip(),
-                    "LeadTime": lead_in if lead_in > 0 else np.nan,
-                    "DaysToCover": cover_in if cover_in > 0 else np.nan,
-                    "ServiceLevel": sl_in if sl_in > 0 else np.nan,
-                    "MinStock": min_in if min_in > 0 else np.nan,
-                }
+                df_one = pd.DataFrame(
+                    [{
+                        "SKU": sku_in.strip(),
+                        "ProductName": name_in.strip() if name_in else None,
+                        "Category": cat_in.strip() if cat_in else None,
+                        "LeadTime": lt if lt > 0 else None,
+                        "DaysToCover": dc if dc > 0 else None,
+                        "ServiceLevel": sl if sl > 0 else None,
+                        "MinStock": ms if ms > 0 else None,
+                    }]
+                )
+                upsert_products(df_one)
+                st.success("✅ Saved! Refresh the page.")
+                st.stop()
 
-                if "SKU" in catalog.columns and (catalog["SKU"] == sku_clean).any():
-                    idx = catalog.index[catalog["SKU"] == sku_clean][0]
-                    for k, v in row.items():
-                        catalog.at[idx, k] = v
-                else:
-                    catalog = pd.concat([catalog, pd.DataFrame([row])], ignore_index=True)
-
-                st.session_state["catalog"] = catalog
-                st.success(f"Saved: {sku_clean}")
-
-        if colB.button("🧹 Clear catalog (demo only)"):
-            st.session_state["catalog"] = pd.DataFrame(
-                columns=["SKU", "ProductName", "Category", "LeadTime", "DaysToCover", "ServiceLevel", "MinStock"]
-            )
-            catalog = st.session_state["catalog"]
-            st.warning("Catalog cleared.")
-
-    st.markdown("### Current catalog")
-    st.dataframe(st.session_state["catalog"], use_container_width=True)
-
-    # Download catalog template
-    st.markdown("### Download PRODUCTS template")
-    template = pd.DataFrame(
-        [{
-            "SKU": "SKU001",
-            "ProductName": "Example product",
-            "Category": "Example category",
-            "LeadTime": 7,
-            "DaysToCover": 14,
-            "ServiceLevel": 95,
-            "MinStock": 0,
-        }]
-    )
-    st.download_button(
-        "⬇️ Download products_template.csv",
-        data=template.to_csv(index=False).encode("utf-8"),
-        file_name="products_template.csv",
-        mime="text/csv"
-    )
-
-# =========================
-# TAB: FORECAST
+# -----------------------
+# FORECAST tab
+# -----------------------
 with tab_forecast:
-    st.subheader("📊 Forecast & Reorder Suggestions")
-    st.caption("Sales data is grouped by SKU and calculated with either global defaults or per-SKU overrides.")
+    st.subheader("Forecast & Reorder Suggestions")
+    if sales.empty:
+        st.warning("Δεν υπάρχουν SALES δεδομένα ακόμα. Ανέβασε SALES CSV (weekly) ή πάτα 'Use demo sample data' και 'Apply upload'.")
+        st.stop()
 
-    st.markdown("### Sales data preview")
-    st.dataframe(sales_df.head(20), use_container_width=True)
+    st.caption("Το σύστημα περιμένει daily totals ανά Date+SKU. Κάθε εβδομάδα κάνεις upload νέο CSV και το ιστορικό ενημερώνεται (append/replace).")
 
-    # Merge catalog onto results later
-    catalog = st.session_state["catalog"].copy()
-    if not catalog.empty:
-        catalog["SKU"] = catalog["SKU"].astype(str).str.strip()
+    # Preview
+    st.markdown("### 📄 Sales data preview")
+    st.dataframe(sales.tail(50), use_container_width=True)
 
-    # Forecast engine
+    # Merge product info (optional)
+    if not products.empty:
+        sales2 = sales.merge(products[["SKU", "ProductName", "Category"]], on="SKU", how="left")
+    else:
+        sales2 = sales.copy()
+
+    # Compute per-SKU stats
+    Z_default = z_from_service_level(int(default_service_level))
+
+    # Per-SKU overrides dict
+    overrides = {}
+    if not products.empty:
+        for _, r in products.iterrows():
+            overrides[r["SKU"]] = {
+                "LeadTime": int(r["LeadTime"]) if pd.notna(r.get("LeadTime")) else None,
+                "DaysToCover": int(r["DaysToCover"]) if pd.notna(r.get("DaysToCover")) else None,
+                "ServiceLevel": int(r["ServiceLevel"]) if pd.notna(r.get("ServiceLevel")) else None,
+                "MinStock": float(r["MinStock"]) if pd.notna(r.get("MinStock")) else None,
+            }
+
     results = []
-    for sku in sales_df["SKU"].unique():
-        temp = sales_df[sales_df["SKU"] == sku].copy()
+    for sku in sorted(sales["SKU"].unique()):
+        temp = sales[sales["SKU"] == sku].copy().sort_values("Date")
 
         avg_demand = float(temp["Quantity"].mean())
         std_demand = float(temp["Quantity"].std(ddof=1)) if len(temp) > 1 else 0.0
         current_stock = float(temp["Stock"].iloc[-1])
 
-        # per-SKU overrides (if in catalog)
-        lead_time = default_lead_time
-        days_to_cover = default_days_to_cover
-        service_level = default_service_level
-        min_stock = default_min_stock
+        # Apply overrides if exist
+        lt = overrides.get(sku, {}).get("LeadTime") or int(default_lead_time)
+        dc = overrides.get(sku, {}).get("DaysToCover") or int(default_days_to_cover)
+        sl = overrides.get(sku, {}).get("ServiceLevel") or int(default_service_level)
+        z = z_from_service_level(int(sl))
+        min_stock_rule = overrides.get(sku, {}).get("MinStock")
+        if min_stock_rule is None:
+            min_stock_rule = float(default_min_stock)
 
-        if not catalog.empty and (catalog["SKU"] == sku).any():
-            row = catalog[catalog["SKU"] == sku].iloc[0]
-            lead_time = safe_int(row.get("LeadTime"), lead_time) or lead_time
-            days_to_cover = safe_int(row.get("DaysToCover"), days_to_cover) or days_to_cover
-            service_level = safe_int(row.get("ServiceLevel"), service_level) or service_level
-            min_stock = safe_float(row.get("MinStock"), min_stock) if default_min_stock > 0 else safe_float(row.get("MinStock"), min_stock)
+        safety_stock = z * std_demand * np.sqrt(lt)
+        reorder_point = (avg_demand * lt) + safety_stock
+        target_stock = (avg_demand * dc) + safety_stock
 
-        Z = z_from_service(float(service_level))
-
-        safety_stock = float(Z * std_demand * np.sqrt(lead_time))
-        reorder_point = float(avg_demand * lead_time + safety_stock)
-
-        target_stock = float(avg_demand * days_to_cover + safety_stock)
-        # Optional rule: ensure target stock >= min_stock
-        if min_stock and min_stock > 0:
-            target_stock = max(target_stock, float(min_stock))
+        # Apply minimum stock floor if set
+        if min_stock_rule and min_stock_rule > 0:
+            reorder_point = max(reorder_point, min_stock_rule)
+            target_stock = max(target_stock, min_stock_rule)
 
         order_qty = max(0, int(round(target_stock - current_stock)))
         status = "✅ OK" if current_stock >= reorder_point else "⚠️ LOW STOCK"
 
         results.append({
             "SKU": sku,
-            "Avg Demand": round(avg_demand, 2),
-            "Std Demand": round(std_demand, 2),
-            "LeadTime": int(lead_time),
-            "ServiceLevel": int(service_level),
-            "DaysToCover": int(days_to_cover),
-            "Safety Stock": round(safety_stock, 2),
-            "Reorder Point": round(reorder_point, 2),
-            "Target Stock": round(target_stock, 2),
-            "Current Stock": int(round(current_stock)),
-            "Order Qty": int(order_qty),
-            "Status": status,
+            "AvgDemand": round(avg_demand, 2),
+            "StdDemand": round(std_demand, 2),
+            "LeadTime": int(lt),
+            "ServiceLevel": int(sl),
+            "DaysToCover": int(dc),
+            "SafetyStock": round(safety_stock, 2),
+            "ReorderPoint": round(reorder_point, 2),
+            "TargetStock": round(target_stock, 2),
+            "CurrentStock": int(round(current_stock)),
+            "OrderQty": order_qty,
+            "Status": status
         })
 
-    res_df = pd.DataFrame(results)
+    res = pd.DataFrame(results)
 
-    # merge product fields if exist
-    if not catalog.empty and "SKU" in catalog.columns:
-        # keep only product info columns (avoid duplicate params)
-        keep_cols = [c for c in ["SKU", "ProductName", "Category"] if c in catalog.columns]
-        res_df = res_df.merge(catalog[keep_cols].drop_duplicates("SKU"), on="SKU", how="left")
+    # Add product info columns if available
+    if not products.empty:
+        res = res.merge(products[["SKU", "ProductName", "Category"]], on="SKU", how="left")
 
-    # Days of cover & severity
-    res_df["Days of Cover"] = res_df.apply(
-        lambda r: round(r["Current Stock"] / r["Avg Demand"], 1) if r["Avg Demand"] > 0 else np.nan,
-        axis=1,
-    )
-    res_df["Severity"] = (res_df["Reorder Point"] - res_df["Current Stock"]).clip(lower=0)
+    # Days of Cover and Severity
+    res["DaysOfCover"] = res.apply(lambda r: round(r["CurrentStock"] / r["AvgDemand"], 1) if r["AvgDemand"] > 0 else np.nan, axis=1)
+    res["Severity"] = (res["ReorderPoint"] - res["CurrentStock"]).clip(lower=0)
 
     # Executive summary
     st.markdown("### 🧾 Executive Summary")
-    total_skus = len(res_df)
-    low_count = int(res_df["Status"].str.contains("LOW STOCK").sum())
-    ok_count = int(total_skus - low_count)
+    total_skus = len(res)
+    low_count = int(res["Status"].str.contains("LOW STOCK").sum())
+    ok_count = total_skus - low_count
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Products", total_skus)
-    c2.metric("LOW STOCK", low_count)
-    c3.metric("OK", ok_count)
-    c4.metric("Units to order", int(res_df["Order Qty"].sum()))
+    a, b, c, d = st.columns(4)
+    a.metric("Products", total_skus)
+    b.metric("⚠️ LOW STOCK", low_count)
+    c.metric("✅ OK", ok_count)
+    d.metric("Default DaysToCover", int(default_days_to_cover))
 
-    critical = res_df.sort_values(["Severity", "Days of Cover"], ascending=[False, True]).head(5)
     st.markdown("**Top 5 most critical**")
-    show_cols_crit = [c for c in ["SKU", "ProductName", "Current Stock", "Reorder Point", "Days of Cover", "Order Qty", "Status"] if c in critical.columns]
-    st.dataframe(critical[show_cols_crit], use_container_width=True)
+    critical = res.sort_values(["Severity", "DaysOfCover"], ascending=[False, True]).head(5)
 
-    # Table
-    st.markdown("### 📊 Reorder Table")
-    show_only_orders = st.checkbox("Show only SKUs with Order Qty > 0", value=True)
-    table_df = res_df[res_df["Order Qty"] > 0].copy() if show_only_orders else res_df.copy()
-    table_df = table_df.sort_values(["Status", "Severity", "Order Qty"], ascending=[True, False, False])
+    show_cols = ["SKU", "ProductName", "Category", "CurrentStock", "ReorderPoint", "DaysOfCover", "OrderQty", "Status"]
+    show_cols = [c for c in show_cols if c in critical.columns]
+    st.dataframe(critical[show_cols], use_container_width=True)
 
-    base_cols = ["SKU", "ProductName", "Category", "Current Stock", "Days of Cover", "Reorder Point",
-                 "Target Stock", "Order Qty", "Status", "LeadTime", "ServiceLevel", "DaysToCover"]
-    cols = [c for c in base_cols if c in table_df.columns] + [c for c in table_df.columns if c not in base_cols]
+    st.divider()
 
-    st.dataframe(table_df[cols].drop(columns=["Severity"], errors="ignore"), use_container_width=True)
+    st.markdown("### 📊 Reorder table")
+    show_only_orders = st.checkbox("Show only SKUs needing order (OrderQty > 0)", value=True)
+    out = res[res["OrderQty"] > 0].copy() if show_only_orders else res.copy()
+    out = out.sort_values(["Status", "Severity", "OrderQty"], ascending=[True, False, False])
 
-    # Downloads
-    st.markdown("### ⬇️ Downloads")
-    csv_bytes = table_df.drop(columns=["Severity"], errors="ignore").to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", data=csv_bytes, file_name="reorder_suggestions.csv", mime="text/csv")
+    # Friendly columns ordering
+    preferred = ["SKU", "ProductName", "Category", "CurrentStock", "DaysOfCover", "ReorderPoint", "TargetStock", "OrderQty", "LeadTime", "ServiceLevel", "DaysToCover", "Status"]
+    cols = [c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]
+    st.dataframe(out[cols], use_container_width=True)
 
-    # Excel export
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        table_df.drop(columns=["Severity"], errors="ignore").to_excel(writer, index=False, sheet_name="Reorder")
-        critical.drop(columns=["Severity"], errors="ignore").to_excel(writer, index=False, sheet_name="Top5")
     st.download_button(
-        "Download Excel (reorder_report.xlsx)",
-        data=buffer.getvalue(),
-        file_name="reorder_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "⬇️ Download reorder_suggestions.csv",
+        data=out[cols].to_csv(index=False).encode("utf-8"),
+        file_name="reorder_suggestions.csv",
+        mime="text/csv",
     )
 
-    # Plot
-    st.markdown("### 📈 Plot (7-day avg sales)")
-    sku_selected = st.selectbox("Select SKU for plot:", options=sorted(sales_df["SKU"].unique()))
-    temp = sales_df[sales_df["SKU"] == sku_selected].copy()
+    st.divider()
+
+    st.markdown("### 📈 SKU chart (7-day avg sales)")
+    sku_selected = st.selectbox("Pick SKU", options=sorted(sales["SKU"].unique()))
+    temp = sales[sales["SKU"] == sku_selected].copy().sort_values("Date")
     temp["Sales_7d_avg"] = temp["Quantity"].rolling(7, min_periods=1).mean()
 
-    reorder_line = float(res_df.loc[res_df["SKU"] == sku_selected, "Reorder Point"].iloc[0])
+    reorder_line = float(res.loc[res["SKU"] == sku_selected, "ReorderPoint"].iloc[0])
 
     plt.figure(figsize=(12, 4))
     plt.plot(temp["Date"], temp["Sales_7d_avg"], label="7-day avg sales")
     plt.axhline(y=reorder_line, linestyle="--", label="Reorder Point")
-    plt.title(f"{sku_selected} - Demand (7-day avg) & Reorder Point")
+    plt.title(f"{sku_selected} — Demand (7-day avg) & Reorder Point")
     plt.legend()
     st.pyplot(plt.gcf())
-    plt.clf()
+    plt.close()
 
-# =========================
-# TAB: HELP
+# -----------------------
+# HELP tab
+# -----------------------
 with tab_help:
-    st.subheader("❓ How to use")
+    st.subheader("How to use (Weekly CSV)")
     st.markdown(
         """
-**Typical workflow:**
-1. (Optional) Add your products in **Products** tab (SKU, name, category, per-SKU params).
-2. Upload your **SALES CSV** (must contain: Date, SKU, Quantity, Stock).
-3. Check the **Forecast** tab for:
-   - low stock alerts
-   - suggested order quantity
-   - top critical SKUs
-4. Download the reorder report (CSV or Excel).
+**1) SALES CSV (weekly upload)**  
+- Format: `Date, SKU, Quantity, Stock`  
+- Daily totals per SKU.  
+- Κάθε εβδομάδα ανεβάζεις νέο αρχείο → το app κάνει **append/replace** στο ιστορικό (unique Date+SKU).
 
-**CSV format (sales):**
-- Date: YYYY-MM-DD
-- SKU: product code
-- Quantity: units sold
-- Stock: units in stock at end of day (or latest snapshot)
+**2) PRODUCTS CSV (optional)**  
+- Format: `SKU, ProductName, Category, LeadTime, DaysToCover, ServiceLevel, MinStock`  
+- Τα LeadTime/DaysToCover/ServiceLevel/MinStock είναι **overrides ανά SKU**.
 
-**PRODUCTS CSV template:**
-Download it from the Products tab.
-        """
+**3) Tip**  
+- Αν έχεις διαφορετικό stock rule (π.χ. min stock) βάλε `MinStock` στο PRODUCTS.
+"""
     )
