@@ -598,6 +598,9 @@ with tab_forecast:
 # =========================================================
 # HELP TAB
 # =========================================================
+# =========================================================
+# HELP TAB
+# =========================================================
 with tab_help:
     st.subheader("📘 How to Use InventoryAI")
 
@@ -617,14 +620,77 @@ with tab_help:
 
 Πρέπει να έχει ακριβώς αυτές τις στήλες:
 
-- `Date`
-- `SKU`
-- `Quantity`
-- `Stock`
+- Date
+- SKU
+- Quantity
+- Stock
 
 ### Παράδειγμα
-```csv
-Date,SKU,Quantity,Stock
-2026-03-01,SKU001,5,120
-2026-03-01,SKU002,3,80
-2026-03-02,SKU001,4,116
+Date,SKU,Quantity,Stock  
+2026-03-01,SKU001,5,120  
+2026-03-01,SKU002,3,80  
+2026-03-02,SKU001,4,116  
+""")
+
+    st.markdown("""
+## 3. PRODUCTS CSV format (optional)
+Το PRODUCTS CSV είναι προαιρετικό αλλά βοηθά πολύ.
+
+Μπορεί να έχει:
+
+- SKU
+- ProductName
+- Category
+- LeadTime
+- DaysToCover
+- ServiceLevel
+- MinStock
+
+### Παράδειγμα
+SKU,ProductName,Category,LeadTime,DaysToCover,ServiceLevel,MinStock  
+SKU001,Paracetamol 500mg,Pharmacy,7,14,95,20  
+SKU002,Vitamin C 1000mg,Supplements,10,20,95,10  
+""")
+
+    st.markdown("""
+## 4. Weekly workflow
+Κάθε εβδομάδα κάνεις τα εξής:
+
+1. Εξάγεις το SALES CSV από το POS / ERP / Excel
+2. Το ανεβάζεις από το sidebar
+3. Πατάς **Apply Upload**
+4. Πηγαίνεις στο tab **Forecast**
+5. Βλέπεις τις προτάσεις παραγγελίας
+6. Κατεβάζεις το `reorder_suggestions.csv`
+""")
+
+    st.markdown("""
+## 5. Τι σημαίνουν οι βασικοί όροι
+
+### Avg Demand
+Η μέση ημερήσια ζήτηση του προϊόντος.
+
+### Reorder Point
+Το επίπεδο stock στο οποίο πρέπει να ξεκινήσεις νέα παραγγελία.
+
+### Target Stock
+Το ιδανικό stock που θέλεις να έχεις.
+
+### Order Qty
+Πόσα τεμάχια πρέπει να παραγγείλεις τώρα.
+
+### Days of Cover
+Για πόσες ημέρες καλύπτει το τρέχον stock.
+
+### Stockout in (days)
+Σε πόσες ημέρες εκτιμάται ότι θα τελειώσει το stock.
+""")
+
+    st.markdown("""
+## 6. Tips
+- Αν έχεις πολλά προϊόντα, χρησιμοποίησε το πεδίο **Search**
+- Αν θες διαφορετικό κανόνα για συγκεκριμένο προϊόν, βάλε overrides στο PRODUCTS CSV
+- Αν θες να ξεκινήσεις δοκιμαστικά, ενεργοποίησε το **Use demo sample data**
+""")
+
+    st.success("Ο πελάτης μπορεί να διαβάζει αυτό το tab χωρίς να χρειάζεται εξωτερικό PDF.")
