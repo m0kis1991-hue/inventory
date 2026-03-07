@@ -1,11 +1,15 @@
+import os
 import sqlite3
+import hashlib
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
 # =========================================================
-# PAGE CONFIG
+# CONFIG
 # =========================================================
 st.set_page_config(
     page_title="InventoryAI",
@@ -13,13 +17,33 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("📦 InventoryAI")
-st.caption(
-    "Inventory planning for small businesses — upload sales, track stock, forecast demand, "
-    "and generate smarter reorder suggestions."
-)
-
 DB_PATH = "inventory_ai.sqlite"
+
+# =========================================================
+# SECURITY / PASSWORD HASHING
+# =========================================================
+def hash_password(password: str, salt: bytes | None = None) -> tuple[str, str]:
+    if salt is None:
+        salt = os.urandom(16)
+    hashed = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        200_000
+    )
+    return salt.hex(), hashed.hex()
+
+
+def verify_password(password: str, salt_hex: str, password_hash_hex: str) -> bool:
+    salt = bytes.fromhex(salt_hex)
+    hashed = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        200_000
+    )
+    return hashed.hex() == password_hash_hex
+
 
 # =========================================================
 # DATABASE
@@ -32,19 +56,37 @@ def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
+    # Users
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_salt TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            store_name TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    # Sales per user
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sales (
+            user_id INTEGER NOT NULL,
             date TEXT NOT NULL,
             sku TEXT NOT NULL,
             quantity REAL NOT NULL,
             stock REAL NOT NULL,
-            PRIMARY KEY (date, sku)
+            PRIMARY KEY (user_id, date, sku),
+            FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
 
+    # Products per user
     cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
-            sku TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            sku TEXT NOT NULL,
             product_name TEXT,
             category TEXT,
             supplier TEXT,
@@ -55,7 +97,9 @@ def init_db():
             unit_cost REAL,
             unit_price REAL,
             promo_min_qty REAL,
-            promo_unit_cost REAL
+            promo_unit_cost REAL,
+            PRIMARY KEY (user_id, sku),
+            FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
 
@@ -63,16 +107,97 @@ def init_db():
     conn.close()
 
 
-def reset_database():
+def get_user_count() -> int:
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM sales")
-    cur.execute("DELETE FROM products")
+    cur.execute("SELECT COUNT(*) FROM users")
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
+
+def create_user(username: str, password: str, store_name: str, role: str = "user") -> tuple[bool, str]:
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        salt_hex, hash_hex = hash_password(password)
+        cur.execute("""
+            INSERT INTO users (username, password_salt, password_hash, store_name, role, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            username.strip(),
+            salt_hex,
+            hash_hex,
+            store_name.strip(),
+            role,
+            datetime.utcnow().isoformat()
+        ))
+        conn.commit()
+        return True, "User created successfully."
+    except sqlite3.IntegrityError:
+        return False, "Username already exists."
+    finally:
+        conn.close()
+
+
+def authenticate_user(username: str, password: str):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, username, password_salt, password_hash, store_name, role
+        FROM users
+        WHERE username = ?
+    """, (username.strip(),))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    user_id, db_username, salt_hex, hash_hex, store_name, role = row
+    if verify_password(password, salt_hex, hash_hex):
+        return {
+            "id": user_id,
+            "username": db_username,
+            "store_name": store_name,
+            "role": role
+        }
+    return None
+
+
+def list_users():
+    conn = get_conn()
+    df = pd.read_sql_query("""
+        SELECT id, username, store_name, role, created_at
+        FROM users
+        ORDER BY id
+    """, conn)
+    conn.close()
+    return df
+
+
+def delete_user(user_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sales WHERE user_id = ?", (user_id,))
+    cur.execute("DELETE FROM products WHERE user_id = ?", (user_id,))
+    cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
     conn.commit()
     conn.close()
 
 
-def upsert_sales(df: pd.DataFrame):
+def reset_user_data(user_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sales WHERE user_id = ?", (user_id,))
+    cur.execute("DELETE FROM products WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def upsert_sales(user_id: int, df: pd.DataFrame) -> int:
     conn = get_conn()
     cur = conn.cursor()
 
@@ -80,11 +205,14 @@ def upsert_sales(df: pd.DataFrame):
     rows["Date"] = pd.to_datetime(rows["Date"]).dt.strftime("%Y-%m-%d")
     rows["SKU"] = rows["SKU"].astype(str).str.strip()
 
-    payload = list(rows[["Date", "SKU", "Quantity", "Stock"]].itertuples(index=False, name=None))
+    payload = [
+        (user_id, row.Date, row.SKU, float(row.Quantity), float(row.Stock))
+        for row in rows.itertuples(index=False)
+    ]
 
     cur.executemany("""
-        INSERT OR REPLACE INTO sales (date, sku, quantity, stock)
-        VALUES (?, ?, ?, ?)
+        INSERT OR REPLACE INTO sales (user_id, date, sku, quantity, stock)
+        VALUES (?, ?, ?, ?, ?)
     """, payload)
 
     conn.commit()
@@ -92,7 +220,7 @@ def upsert_sales(df: pd.DataFrame):
     return len(payload)
 
 
-def upsert_products(df: pd.DataFrame):
+def upsert_products(user_id: int, df: pd.DataFrame) -> int:
     conn = get_conn()
     cur = conn.cursor()
 
@@ -101,31 +229,29 @@ def upsert_products(df: pd.DataFrame):
 
     payload = []
     for _, r in df.iterrows():
-        payload.append(
-            (
-                r["SKU"],
-                r["ProductName"] if "ProductName" in df.columns else None,
-                r["Category"] if "Category" in df.columns else None,
-                r["Supplier"] if "Supplier" in df.columns else None,
-                int(r["LeadTime"]) if "LeadTime" in df.columns and pd.notna(r["LeadTime"]) else None,
-                int(r["DaysToCover"]) if "DaysToCover" in df.columns and pd.notna(r["DaysToCover"]) else None,
-                int(r["ServiceLevel"]) if "ServiceLevel" in df.columns and pd.notna(r["ServiceLevel"]) else None,
-                float(r["MinStock"]) if "MinStock" in df.columns and pd.notna(r["MinStock"]) else None,
-                float(r["UnitCost"]) if "UnitCost" in df.columns and pd.notna(r["UnitCost"]) else None,
-                float(r["UnitPrice"]) if "UnitPrice" in df.columns and pd.notna(r["UnitPrice"]) else None,
-                float(r["PromoMinQty"]) if "PromoMinQty" in df.columns and pd.notna(r["PromoMinQty"]) else None,
-                float(r["PromoUnitCost"]) if "PromoUnitCost" in df.columns and pd.notna(r["PromoUnitCost"]) else None,
-            )
-        )
+        payload.append((
+            user_id,
+            r["SKU"],
+            r["ProductName"] if "ProductName" in df.columns else None,
+            r["Category"] if "Category" in df.columns else None,
+            r["Supplier"] if "Supplier" in df.columns else None,
+            int(r["LeadTime"]) if "LeadTime" in df.columns and pd.notna(r["LeadTime"]) else None,
+            int(r["DaysToCover"]) if "DaysToCover" in df.columns and pd.notna(r["DaysToCover"]) else None,
+            int(r["ServiceLevel"]) if "ServiceLevel" in df.columns and pd.notna(r["ServiceLevel"]) else None,
+            float(r["MinStock"]) if "MinStock" in df.columns and pd.notna(r["MinStock"]) else None,
+            float(r["UnitCost"]) if "UnitCost" in df.columns and pd.notna(r["UnitCost"]) else None,
+            float(r["UnitPrice"]) if "UnitPrice" in df.columns and pd.notna(r["UnitPrice"]) else None,
+            float(r["PromoMinQty"]) if "PromoMinQty" in df.columns and pd.notna(r["PromoMinQty"]) else None,
+            float(r["PromoUnitCost"]) if "PromoUnitCost" in df.columns and pd.notna(r["PromoUnitCost"]) else None,
+        ))
 
     cur.executemany("""
-        INSERT OR REPLACE INTO products
-        (
-            sku, product_name, category, supplier,
+        INSERT OR REPLACE INTO products (
+            user_id, sku, product_name, category, supplier,
             lead_time_override, days_to_cover_override, service_level_override, min_stock_override,
             unit_cost, unit_price, promo_min_qty, promo_unit_cost
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, payload)
 
     conn.commit()
@@ -133,7 +259,7 @@ def upsert_products(df: pd.DataFrame):
     return len(payload)
 
 
-def load_sales():
+def load_sales(user_id: int) -> pd.DataFrame:
     conn = get_conn()
     df = pd.read_sql_query("""
         SELECT
@@ -142,7 +268,8 @@ def load_sales():
             quantity AS Quantity,
             stock AS Stock
         FROM sales
-    """, conn)
+        WHERE user_id = ?
+    """, conn, params=(user_id,))
     conn.close()
 
     if df.empty:
@@ -152,12 +279,10 @@ def load_sales():
     df["SKU"] = df["SKU"].astype(str).str.strip()
     df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0.0)
     df["Stock"] = pd.to_numeric(df["Stock"], errors="coerce").fillna(0.0)
-
-    df = df.sort_values(["SKU", "Date"]).reset_index(drop=True)
-    return df
+    return df.sort_values(["SKU", "Date"]).reset_index(drop=True)
 
 
-def load_products():
+def load_products(user_id: int) -> pd.DataFrame:
     conn = get_conn()
     df = pd.read_sql_query("""
         SELECT
@@ -174,7 +299,8 @@ def load_products():
             promo_min_qty AS PromoMinQty,
             promo_unit_cost AS PromoUnitCost
         FROM products
-    """, conn)
+        WHERE user_id = ?
+    """, conn, params=(user_id,))
     conn.close()
 
     if df.empty:
@@ -188,13 +314,6 @@ def load_products():
 # HELPERS
 # =========================================================
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make incoming CSVs more forgiving:
-    date/date sold -> Date
-    sku/code/item code -> SKU
-    quantity/qty/sales -> Quantity
-    stock/inventory/on hand -> Stock
-    """
     rename_map = {}
     for col in df.columns:
         c = str(col).strip().lower()
@@ -225,9 +344,9 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             rename_map[col] = "UnitCost"
         elif c in ["unitprice", "unit price", "price"]:
             rename_map[col] = "UnitPrice"
-        elif c in ["promominqty", "promo min qty", "minimum promo qty"]:
+        elif c in ["promominqty", "promo min qty"]:
             rename_map[col] = "PromoMinQty"
-        elif c in ["promounitcost", "promo unit cost", "promo cost"]:
+        elif c in ["promounitcost", "promo unit cost"]:
             rename_map[col] = "PromoUnitCost"
 
     return df.rename(columns=rename_map)
@@ -240,22 +359,20 @@ def validate_sales(df: pd.DataFrame) -> pd.DataFrame:
     missing = required_cols - set(df.columns)
 
     if missing:
-        st.error(f"❌ SALES CSV is missing: {', '.join(sorted(missing))}")
-        st.info("Required columns: Date, SKU, Quantity, Stock")
+        st.error(f"❌ SALES CSV λείπουν στήλες: {', '.join(sorted(missing))}")
+        st.info("Απαιτούνται: Date, SKU, Quantity, Stock")
         st.stop()
 
     df = df.copy()
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     if df["Date"].isna().any():
-        st.error("❌ Date column contains invalid dates.")
-        st.info("Example format: 2026-03-04")
+        st.error("❌ Η στήλη Date έχει λάθος τιμές.")
         st.stop()
 
     df["SKU"] = df["SKU"].astype(str).str.strip()
     df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0.0)
     df["Stock"] = pd.to_numeric(df["Stock"], errors="coerce").fillna(0.0)
 
-    # If same Date+SKU appears multiple times in same upload, merge it
     df = (
         df.groupby(["Date", "SKU"], as_index=False)
         .agg({"Quantity": "sum", "Stock": "last"})
@@ -268,7 +385,7 @@ def validate_products(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_columns(df)
 
     if "SKU" not in df.columns:
-        st.error("❌ PRODUCTS CSV must contain SKU.")
+        st.error("❌ PRODUCTS CSV πρέπει να έχει SKU.")
         st.stop()
 
     df = df.copy()
@@ -302,7 +419,7 @@ def sales_template_csv():
 def products_template_csv():
     sample = pd.DataFrame([
         ["SKU001", "Paracetamol 500mg", "Pharmacy", "Supplier A", 7, 14, 95, 20, 1.50, 3.20, 100, 1.25],
-        ["SKU002", "Vitamin C 1000mg", "Supplements", "Supplier B", 10, 20, 95, 10, 2.10, 4.90, "", ""],
+        ["SKU002", "Vitamin C 1000mg", "Supplements", "Supplier B", 10, 20, 95, 10, "", "", "", ""],
     ], columns=[
         "SKU", "ProductName", "Category", "Supplier",
         "LeadTime", "DaysToCover", "ServiceLevel", "MinStock",
@@ -312,7 +429,7 @@ def products_template_csv():
 
 
 @st.cache_data
-def generate_demo_sales(num_skus=120, days=730):
+def generate_demo_sales(num_skus=80, days=730):
     np.random.seed(42)
     skus = [f"SKU{i:04}" for i in range(1, num_skus + 1)]
     dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=days, freq="D")
@@ -323,7 +440,6 @@ def generate_demo_sales(num_skus=120, days=730):
         stock = np.random.randint(100, 600)
 
         for d in dates:
-            # crude seasonality effect
             month = d.month
             season_boost = 1.0
             if month in [11, 12]:
@@ -340,13 +456,12 @@ def generate_demo_sales(num_skus=120, days=730):
 
             rows.append([d, sku, float(qty), float(stock)])
 
-    df = pd.DataFrame(rows, columns=["Date", "SKU", "Quantity", "Stock"])
-    return df
+    return pd.DataFrame(rows, columns=["Date", "SKU", "Quantity", "Stock"])
 
 
 @st.cache_data
-def generate_demo_products(num_skus=120):
-    categories = ["Pharmacy", "Supplements", "Hygiene", "Beverages", "Pet", "Grocery"]
+def generate_demo_products(num_skus=80):
+    categories = ["Pharmacy", "Supplements", "Hygiene", "Grocery"]
     suppliers = ["Supplier A", "Supplier B", "Supplier C"]
 
     rows = []
@@ -358,23 +473,13 @@ def generate_demo_products(num_skus=120):
         unit_cost = round(np.random.uniform(1.0, 12.0), 2)
         unit_price = round(unit_cost * np.random.uniform(1.4, 2.2), 2)
 
-        if i % 5 == 0:
-            promo_min = 100
-            promo_unit_cost = round(unit_cost * 0.90, 2)
-        else:
-            promo_min = None
-            promo_unit_cost = None
+        promo_min = 100 if i % 5 == 0 else None
+        promo_cost = round(unit_cost * 0.90, 2) if promo_min else None
 
         rows.append([
-            sku,
-            f"Demo Product {i}",
-            category,
-            supplier,
+            sku, f"Demo Product {i}", category, supplier,
             None, None, None, None,
-            unit_cost,
-            unit_price,
-            promo_min,
-            promo_unit_cost
+            unit_cost, unit_price, promo_min, promo_cost
         ])
 
     return pd.DataFrame(rows, columns=[
@@ -385,10 +490,6 @@ def generate_demo_products(num_skus=120):
 
 
 def current_event_multiplier(row, event_name, event_pct, keyword):
-    """
-    Manual event multipliers for current market situation.
-    Example: Christmas, flu, tourism season, etc.
-    """
     if event_name == "None" or event_pct == 0:
         return 1.0
 
@@ -408,34 +509,101 @@ def current_event_multiplier(row, event_name, event_pct, keyword):
 
 
 # =========================================================
-# INIT DB
+# INIT + SESSION
 # =========================================================
 init_db()
 
+if "auth_user" not in st.session_state:
+    st.session_state["auth_user"] = None
+
 # =========================================================
-# SIDEBAR
+# FIRST-TIME SETUP
 # =========================================================
+if get_user_count() == 0:
+    st.subheader("🔐 First-time setup")
+    st.info("Δημιούργησε τον πρώτο admin χρήστη για την εφαρμογή.")
+
+    with st.form("setup_admin_form"):
+        admin_username = st.text_input("Admin username")
+        admin_password = st.text_input("Admin password", type="password")
+        admin_store = st.text_input("Store name", value="Main Store")
+        submitted = st.form_submit_button("Create admin")
+
+        if submitted:
+            if not admin_username.strip() or not admin_password.strip() or not admin_store.strip():
+                st.error("Συμπλήρωσε όλα τα πεδία.")
+            else:
+                ok, msg = create_user(
+                    username=admin_username,
+                    password=admin_password,
+                    store_name=admin_store,
+                    role="admin"
+                )
+                if ok:
+                    st.success("✅ Admin created. Κάνε refresh και κάνε login.")
+                else:
+                    st.error(msg)
+    st.stop()
+
+# =========================================================
+# LOGIN
+# =========================================================
+if st.session_state["auth_user"] is None:
+    st.subheader("🔑 Login")
+
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
+
+        if submitted:
+            user = authenticate_user(username, password)
+            if user:
+                st.session_state["auth_user"] = user
+                st.rerun()
+            else:
+                st.error("Λάθος username ή password.")
+
+    st.markdown("""
+### Τι σημαίνει αυτό το σύστημα
+Κάθε χρήστης βλέπει **μόνο τα δικά του δεδομένα**:
+- δικό του κατάστημα
+- δικά του προϊόντα
+- δικές του πωλήσεις
+- δικές του προβλέψεις
+""")
+    st.stop()
+
+# =========================================================
+# AUTHENTICATED APP
+# =========================================================
+user = st.session_state["auth_user"]
+user_id = user["id"]
+username = user["username"]
+store_name = user["store_name"]
+role = user["role"]
+
+st.sidebar.success(f"👤 {username}")
+st.sidebar.caption(f"🏪 {store_name}")
+st.sidebar.caption(f"Role: {role}")
+
+if st.sidebar.button("Logout"):
+    st.session_state["auth_user"] = None
+    st.rerun()
+
+# =========================================================
+# SIDEBAR SETTINGS
+# =========================================================
+st.sidebar.divider()
 st.sidebar.header("⚙️ Inventory Strategy")
 
 use_demo = st.sidebar.checkbox("Use demo sample data", value=False)
 
 default_lead_time = st.sidebar.number_input("Default Lead Time (days)", min_value=1, value=7)
 default_service_level = st.sidebar.slider("Default Service Level (%)", min_value=80, max_value=99, value=95)
-
-default_days_to_cover = st.sidebar.number_input(
-    "Target Inventory (days of stock)",
-    min_value=1,
-    value=14
-)
-
+default_days_to_cover = st.sidebar.number_input("Target Inventory (days of stock)", min_value=1, value=14)
 default_min_stock = st.sidebar.number_input("Default Minimum Stock", min_value=0.0, value=0.0)
-
-annual_holding_rate_pct = st.sidebar.number_input(
-    "Annual Carrying Cost (%)",
-    min_value=0.0,
-    value=18.0,
-    help="Estimated annual cost of holding extra stock."
-)
+annual_holding_rate_pct = st.sidebar.number_input("Annual Carrying Cost (%)", min_value=0.0, value=18.0)
 
 st.sidebar.divider()
 st.sidebar.subheader("📈 Market / Event Adjustment")
@@ -444,27 +612,13 @@ event_name = st.sidebar.selectbox(
     "Current event",
     ["None", "Christmas / Holidays", "Flu / Health Spike", "Tourism Season", "Heatwave", "Custom"]
 )
-
-event_pct = st.sidebar.number_input(
-    "Event demand adjustment (%)",
-    min_value=-50.0,
-    max_value=200.0,
-    value=0.0,
-    help="Use positive values for expected increase in demand, negative for decrease."
-)
-
-event_keyword = st.sidebar.text_input(
-    "Apply event only to keyword (optional)",
-    value="",
-    help="Example: pharmacy, cough, flu, toys, gift, sunscreen"
-)
-
+event_pct = st.sidebar.number_input("Event demand adjustment (%)", min_value=-50.0, max_value=200.0, value=0.0)
+event_keyword = st.sidebar.text_input("Apply event only to keyword (optional)", value="")
 manual_market_growth_pct = st.sidebar.number_input(
     "Recent business growth / decline (%)",
     min_value=-80.0,
     max_value=200.0,
-    value=0.0,
-    help="Use this if you know your customer base has recently increased or decreased."
+    value=0.0
 )
 
 st.sidebar.divider()
@@ -475,21 +629,21 @@ products_file = st.sidebar.file_uploader("Upload PRODUCTS CSV (optional)", type=
 
 c1, c2 = st.sidebar.columns(2)
 apply_upload = c1.button("✅ Apply Upload")
-reset_all = c2.button("🧨 Reset Data")
+reset_my_data = c2.button("🧨 Reset My Data")
 
-if reset_all:
-    st.sidebar.warning("This will delete ALL sales and product data.")
-    confirm_reset = st.sidebar.checkbox("Confirm reset")
+if reset_my_data:
+    st.sidebar.warning("This will delete only YOUR store data.")
+    confirm_reset = st.sidebar.checkbox("Confirm my reset")
     if confirm_reset:
-        reset_database()
-        st.sidebar.success("✅ All data deleted. Refresh the page.")
+        reset_user_data(user_id)
+        st.sidebar.success("✅ Your store data was deleted.")
         st.stop()
 
 if apply_upload:
     if use_demo:
-        n_sales = upsert_sales(generate_demo_sales())
-        n_products = upsert_products(generate_demo_products())
-        st.success(f"✅ Demo data loaded: {n_sales:,} sales rows and {n_products:,} products.")
+        n_sales = upsert_sales(user_id, generate_demo_sales())
+        n_products = upsert_products(user_id, generate_demo_products())
+        st.success(f"✅ Demo data loaded for your store: {n_sales:,} sales rows, {n_products:,} products.")
     else:
         if sales_file is None:
             st.error("❌ Please upload SALES CSV first.")
@@ -497,55 +651,63 @@ if apply_upload:
 
         sales_df = pd.read_csv(sales_file)
         sales_df = validate_sales(sales_df)
-        n_sales = upsert_sales(sales_df)
+        n_sales = upsert_sales(user_id, sales_df)
 
         if products_file is not None:
             products_df = pd.read_csv(products_file)
             products_df = validate_products(products_df)
-            n_products = upsert_products(products_df)
+            n_products = upsert_products(user_id, products_df)
             st.success(f"✅ SALES uploaded: {n_sales:,} rows | PRODUCTS uploaded: {n_products:,} rows")
         else:
             st.success(f"✅ SALES uploaded: {n_sales:,} rows")
 
-    st.info("If you do not see the new data immediately, refresh the page.")
+    st.info("If you do not see new data immediately, refresh the page.")
 
 # =========================================================
-# LOAD DATA
+# LOAD USER DATA
 # =========================================================
-sales = load_sales()
-products = load_products()
+sales = load_sales(user_id)
+products = load_products(user_id)
 
 # =========================================================
 # TABS
 # =========================================================
-tab_uploads, tab_products, tab_forecast, tab_help = st.tabs(
-    ["📤 Uploads", "📦 Products", "📊 Forecast", "📘 How to Use"]
-)
+tabs = ["📤 Uploads", "📦 Products", "📊 Forecast", "📘 How to Use"]
+if role == "admin":
+    tabs.append("👥 Users")
+
+tab_objects = st.tabs(tabs)
+
+tab_uploads = tab_objects[0]
+tab_products = tab_objects[1]
+tab_forecast = tab_objects[2]
+tab_help = tab_objects[3]
+tab_users = tab_objects[4] if role == "admin" else None
 
 # =========================================================
 # UPLOADS TAB
 # =========================================================
 with tab_uploads:
-    st.subheader("📤 Upload & Data History")
+    st.subheader(f"📤 Upload Center — {store_name}")
 
     st.markdown("""
-Use this section to build your inventory intelligence over time.
+Upload your sales and product data here.
 
-You can upload:
-- **SALES CSV** with sales that have already happened
-- **PRODUCTS CSV** with your product catalog, supplier info, and stock rules
-
-As you keep uploading new data, the app builds a stronger historical base and improves reorder decisions.
+This application builds a data system over time so it can make better reorder decisions based on:
+- your own past sales
+- recent demand changes
+- seasonality
+- current market or event conditions
 """)
 
-    d1, d2 = st.columns(2)
-    d1.download_button(
+    a, b = st.columns(2)
+    a.download_button(
         "⬇️ Download SALES template.csv",
         data=sales_template_csv(),
         file_name="sales_template.csv",
         mime="text/csv"
     )
-    d2.download_button(
+    b.download_button(
         "⬇️ Download PRODUCTS template.csv",
         data=products_template_csv(),
         file_name="products_template.csv",
@@ -555,13 +717,10 @@ As you keep uploading new data, the app builds a stronger historical base and im
     st.divider()
 
     if sales.empty:
-        st.warning("No sales data uploaded yet.")
+        st.warning("No sales data uploaded yet for this store.")
     else:
-        st.success(f"Stored sales history: {len(sales):,} rows")
+        st.success(f"Stored sales history for this store: {len(sales):,} rows")
         st.dataframe(sales.tail(20), use_container_width=True)
-
-    if not products.empty:
-        st.success(f"Stored products catalog: {len(products):,} products")
 
 # =========================================================
 # PRODUCTS TAB
@@ -569,20 +728,8 @@ As you keep uploading new data, the app builds a stronger historical base and im
 with tab_products:
     st.subheader("📦 Product Catalog")
 
-    st.markdown("""
-Your product catalog is optional, but it makes the app much more useful.
-
-With a PRODUCTS file you can store:
-- product names
-- categories
-- suppliers
-- lead times
-- stock targets
-- supplier promo rules
-""")
-
     if products.empty:
-        st.info("No product catalog uploaded yet.")
+        st.info("No product catalog uploaded yet for this store.")
     else:
         st.dataframe(products, use_container_width=True)
 
@@ -590,18 +737,15 @@ With a PRODUCTS file you can store:
 # FORECAST TAB
 # =========================================================
 with tab_forecast:
-    st.subheader("📊 Demand Forecast & Reorder Suggestions")
+    st.subheader(f"📊 Forecast & Reorder Suggestions — {store_name}")
 
     if sales.empty:
-        st.warning("No sales data found. Upload SALES CSV first.")
+        st.warning("No sales data found for this store. Upload SALES CSV first.")
         st.stop()
 
     st.markdown("### Sales data preview")
     st.dataframe(sales.tail(50), use_container_width=True)
 
-    # -----------------------------------------------------
-    # VECTORISED FORECAST ENGINE FOR 1000+ SKUs
-    # -----------------------------------------------------
     sales = sales.sort_values(["SKU", "Date"]).reset_index(drop=True)
     today = sales["Date"].max()
     current_month = int(today.month)
@@ -617,34 +761,31 @@ with tab_forecast:
             DaysHistory=("Date", "count")
         )
     )
-
     sku_stats["StdAll"] = sku_stats["StdAll"].fillna(0.0)
 
-    # Recent 28-day avg
+    # Recent period
     recent_start = today - pd.Timedelta(days=27)
     recent_df = sales[sales["Date"] >= recent_start]
     recent_avg = recent_df.groupby("SKU")["Quantity"].mean().rename("AvgRecent28")
 
-    # Previous 28-day avg
+    # Previous period
     prev_start = today - pd.Timedelta(days=55)
     prev_end = today - pd.Timedelta(days=28)
     prev_df = sales[(sales["Date"] >= prev_start) & (sales["Date"] <= prev_end)]
     prev_avg = prev_df.groupby("SKU")["Quantity"].mean().rename("AvgPrev28")
 
-    # Same period last year avg
+    # Same period last year
     ly_start = recent_start - pd.Timedelta(days=365)
     ly_end = today - pd.Timedelta(days=365)
     ly_df = sales[(sales["Date"] >= ly_start) & (sales["Date"] <= ly_end)]
     ly_avg = ly_df.groupby("SKU")["Quantity"].mean().rename("AvgSamePeriodLastYear")
 
-    # Current month seasonality
+    # Month seasonality
     sales["Month"] = sales["Date"].dt.month
     month_avg = sales.groupby(["SKU", "Month"])["Quantity"].mean().rename("MonthAvg").reset_index()
     overall_avg = sales.groupby("SKU")["Quantity"].mean().rename("OverallAvg")
-
     current_month_avg = month_avg[month_avg["Month"] == current_month][["SKU", "MonthAvg"]].rename(columns={"MonthAvg": "CurrentMonthAvg"})
 
-    # Merge all stats
     sku_stats = sku_stats.merge(recent_avg, on="SKU", how="left")
     sku_stats = sku_stats.merge(prev_avg, on="SKU", how="left")
     sku_stats = sku_stats.merge(ly_avg, on="SKU", how="left")
@@ -657,7 +798,7 @@ with tab_forecast:
     sku_stats["OverallAvg"] = sku_stats["OverallAvg"].fillna(sku_stats["AvgAll"])
     sku_stats["CurrentMonthAvg"] = sku_stats["CurrentMonthAvg"].fillna(sku_stats["OverallAvg"])
 
-    # Recent trend factor
+    # Trend factor
     sku_stats["RecentTrendFactor"] = np.where(
         sku_stats["AvgPrev28"] > 0,
         sku_stats["AvgRecent28"] / sku_stats["AvgPrev28"],
@@ -665,7 +806,7 @@ with tab_forecast:
     )
     sku_stats["RecentTrendFactor"] = sku_stats["RecentTrendFactor"].clip(lower=0.70, upper=1.50)
 
-    # Yearly seasonality factor
+    # Seasonality factor
     sku_stats["SeasonalityFactor"] = np.where(
         sku_stats["OverallAvg"] > 0,
         sku_stats["CurrentMonthAvg"] / sku_stats["OverallAvg"],
@@ -673,35 +814,34 @@ with tab_forecast:
     )
     sku_stats["SeasonalityFactor"] = sku_stats["SeasonalityFactor"].clip(lower=0.70, upper=1.50)
 
-    # Base blended forecast
+    # Base forecast
     sku_stats["BaseForecastDaily"] = (
         0.45 * sku_stats["AvgRecent28"] +
         0.35 * sku_stats["AvgSamePeriodLastYear"] +
         0.20 * sku_stats["AvgAll"]
     )
 
-    # Apply internal trend + seasonality
     sku_stats["ForecastDaily"] = (
         sku_stats["BaseForecastDaily"] *
         sku_stats["RecentTrendFactor"] *
         sku_stats["SeasonalityFactor"]
     )
 
-    # Apply manual business growth / decline
+    # Business growth / decline
     sku_stats["ForecastDaily"] = sku_stats["ForecastDaily"] * (1 + manual_market_growth_pct / 100.0)
 
-    # Merge product catalog if available
+    # Merge products
     if not products.empty:
         sku_stats = sku_stats.merge(products, on="SKU", how="left")
 
-    # Apply event multiplier row by row only after product fields merged
+    # Event multiplier
     sku_stats["EventMultiplier"] = sku_stats.apply(
         lambda r: current_event_multiplier(r, event_name, event_pct, event_keyword),
         axis=1
     )
     sku_stats["ForecastDaily"] = sku_stats["ForecastDaily"] * sku_stats["EventMultiplier"]
 
-    # Final parameter values
+    # Final params
     if "LeadTime" in sku_stats.columns:
         sku_stats["LeadTimeFinal"] = sku_stats["LeadTime"].fillna(default_lead_time)
     else:
@@ -722,25 +862,21 @@ with tab_forecast:
     else:
         sku_stats["MinStockFinal"] = default_min_stock
 
-    # Safety stock and reorder logic
     z_values = sku_stats["ServiceLevelFinal"].apply(lambda x: get_z(int(x)))
     sku_stats["SafetyStock"] = z_values * sku_stats["StdAll"].fillna(0.0) * np.sqrt(sku_stats["LeadTimeFinal"])
     sku_stats["ReorderPoint"] = (sku_stats["ForecastDaily"] * sku_stats["LeadTimeFinal"]) + sku_stats["SafetyStock"]
     sku_stats["TargetStock"] = (sku_stats["ForecastDaily"] * sku_stats["DaysToCoverFinal"]) + sku_stats["SafetyStock"]
 
-    # Apply minimum stock floor
     sku_stats["ReorderPoint"] = np.maximum(sku_stats["ReorderPoint"], sku_stats["MinStockFinal"])
     sku_stats["TargetStock"] = np.maximum(sku_stats["TargetStock"], sku_stats["MinStockFinal"])
 
     sku_stats["OrderQty"] = (sku_stats["TargetStock"] - sku_stats["CurrentStock"]).clip(lower=0).round().astype(int)
 
-    # Stockout days
     sku_stats["DaysOfCover"] = np.where(
         sku_stats["ForecastDaily"] > 0,
         (sku_stats["CurrentStock"] / sku_stats["ForecastDaily"]).round(1),
         np.nan
     )
-
     sku_stats["StockoutDays"] = np.where(
         sku_stats["ForecastDaily"] > 0,
         np.floor(sku_stats["CurrentStock"] / sku_stats["ForecastDaily"]),
@@ -754,10 +890,8 @@ with tab_forecast:
         "⚠️ LOW STOCK"
     )
 
-    # -----------------------------------------------------
-    # PROMO / BULK BUY LOGIC
-    # -----------------------------------------------------
-    if "UnitCost" in sku_stats.columns and "PromoMinQty" in sku_stats.columns and "PromoUnitCost" in sku_stats.columns:
+    # Promo logic
+    if {"UnitCost", "PromoMinQty", "PromoUnitCost"}.issubset(set(sku_stats.columns)):
         sku_stats["UnitCost"] = pd.to_numeric(sku_stats["UnitCost"], errors="coerce")
         sku_stats["PromoMinQty"] = pd.to_numeric(sku_stats["PromoMinQty"], errors="coerce")
         sku_stats["PromoUnitCost"] = pd.to_numeric(sku_stats["PromoUnitCost"], errors="coerce")
@@ -766,7 +900,6 @@ with tab_forecast:
         sku_stats["ExtraUnitsForPromo"] = (sku_stats["PromoMinQty"] - sku_stats["OrderQty"]).clip(lower=0)
 
         daily_holding_rate = annual_holding_rate_pct / 100.0 / 365.0
-
         sku_stats["ExtraDaysHeld"] = np.where(
             sku_stats["ForecastDaily"] > 0,
             sku_stats["ExtraUnitsForPromo"] / sku_stats["ForecastDaily"],
@@ -814,9 +947,7 @@ with tab_forecast:
         sku_stats["SuggestedOrderFinal"] = sku_stats["OrderQty"]
         sku_stats["NetPromoBenefit"] = 0.0
 
-    # -----------------------------------------------------
-    # SUMMARY
-    # -----------------------------------------------------
+    # Summary
     total_skus = len(sku_stats)
     low_count = int((sku_stats["Status"] == "⚠️ LOW STOCK").sum())
     ok_count = total_skus - low_count
@@ -831,18 +962,16 @@ with tab_forecast:
     st.markdown("### Top 5 most critical products")
     critical = sku_stats.sort_values(["Severity", "DaysOfCover"], ascending=[False, True]).head(5)
 
-    critical_cols = [
-        c for c in [
-            "SKU", "ProductName", "Category",
-            "CurrentStock", "ReorderPoint", "DaysOfCover",
-            "StockoutDays", "SuggestedOrderFinal", "PromoWorthIt", "Status"
-        ] if c in critical.columns
-    ]
+    critical_cols = [c for c in [
+        "SKU", "ProductName", "Category", "CurrentStock",
+        "ReorderPoint", "DaysOfCover", "StockoutDays",
+        "SuggestedOrderFinal", "PromoWorthIt", "Status"
+    ] if c in critical.columns]
+
     st.dataframe(critical[critical_cols], use_container_width=True)
 
     st.divider()
 
-    # Search + filter
     search = st.text_input("🔎 Search SKU / Product / Category / Supplier")
     filtered = sku_stats.copy()
 
@@ -853,7 +982,6 @@ with tab_forecast:
             return series.astype(str).str.lower().str.contains(needle, na=False)
 
         mask = contains(filtered["SKU"])
-
         for optional_col in ["ProductName", "Category", "Supplier"]:
             if optional_col in filtered.columns:
                 mask = mask | contains(filtered[optional_col])
@@ -868,17 +996,16 @@ with tab_forecast:
 
     st.markdown("### Reorder table")
 
-    preferred_cols = [
+    preferred_cols = [c for c in [
         "SKU", "ProductName", "Category", "Supplier",
         "CurrentStock", "ForecastDaily", "DaysOfCover", "StockoutDays",
         "ReorderPoint", "TargetStock", "OrderQty", "SuggestedOrderFinal",
         "PromoWorthIt", "NetPromoBenefit",
         "LeadTimeFinal", "ServiceLevelFinal", "DaysToCoverFinal",
         "Status"
-    ]
-    display_cols = [c for c in preferred_cols if c in filtered.columns]
+    ] if c in filtered.columns]
 
-    display_df = filtered[display_cols].rename(columns={
+    display_df = filtered[preferred_cols].rename(columns={
         "CurrentStock": "Current Stock",
         "ForecastDaily": "Forecast Daily Demand",
         "DaysOfCover": "Days of Cover",
@@ -925,7 +1052,7 @@ with tab_forecast:
     plt.close()
 
 # =========================================================
-# HOW TO USE TAB
+# HELP TAB
 # =========================================================
 with tab_help:
     st.subheader("📘 How to Use")
@@ -942,7 +1069,22 @@ InventoryAI helps a small business understand:
 - how much should be ordered next
 - whether a supplier promotion is financially worth it
 
-The goal is to reduce **stockouts** without holding unnecessary stock.
+The goal is to reduce stockouts without holding unnecessary stock.
+""")
+
+    st.markdown("""
+## Access and store privacy
+
+Each user logs in with their own **username and password**.
+
+After login, the user can see only:
+- their own store
+- their own sales data
+- their own products
+- their own forecasts
+- their own reorder suggestions
+
+No user can see another store's data.
 """)
 
     st.markdown("""
@@ -954,33 +1096,33 @@ The application builds a demand estimate using:
    It checks whether demand has recently increased or decreased.
 
 2. **Historical seasonality**  
-   It compares current season/month behavior with older patterns from previous periods.
+   It compares current season/month behavior with older patterns.
 
 3. **Same period last year**  
-   If previous-year data exists, it uses that period to improve the estimate.
+   If older yearly data exists, it uses that to improve the estimate.
 
 4. **Manual market adjustments**  
-   You can apply market growth/decline and event adjustments such as:
+   You can apply:
    - Christmas / Holidays
    - Flu / Health spike
    - Tourism season
    - Custom events
 
 5. **Inventory rules**  
-   The app combines demand with:
-   - supplier lead time
+   It combines demand with:
+   - lead time
    - desired days of stock
    - service level
-   - optional minimum stock
+   - minimum stock
 """)
 
     st.markdown("""
-## What the user can control
+## What the user controls
 
 The user can define:
 
 - **Lead Time**  
-  How many days a supplier needs to deliver
+  How many days suppliers need to deliver
 
 - **Target Inventory (days of stock)**  
   How long they want to have stock available
@@ -989,7 +1131,7 @@ The user can define:
   The safety margin against stockouts
 
 - **Minimum Stock**  
-  A minimum stock floor for important items
+  A stock floor for important products
 
 This means the user can decide if they want stock for:
 - 7 days
@@ -1001,14 +1143,13 @@ This means the user can decide if they want stock for:
     st.markdown("""
 ## SALES CSV format
 
-The required SALES file must contain:
+Required columns:
+- Date
+- SKU
+- Quantity
+- Stock
 
-- `Date`
-- `SKU`
-- `Quantity`
-- `Stock`
-
-### Example
+Example:
 Date,SKU,Quantity,Stock  
 2026-03-01,SKU001,5,120  
 2026-03-01,SKU002,3,80  
@@ -1018,51 +1159,83 @@ Date,SKU,Quantity,Stock
     st.markdown("""
 ## PRODUCTS CSV format (optional)
 
-The optional PRODUCTS file can contain:
-
-- `SKU`
-- `ProductName`
-- `Category`
-- `Supplier`
-- `LeadTime`
-- `DaysToCover`
-- `ServiceLevel`
-- `MinStock`
-- `UnitCost`
-- `UnitPrice`
-- `PromoMinQty`
-- `PromoUnitCost`
-
-This helps the app:
-- show proper product names
-- apply different stock rules by product
-- calculate whether supplier promos are worth taking
+Optional columns:
+- SKU
+- ProductName
+- Category
+- Supplier
+- LeadTime
+- DaysToCover
+- ServiceLevel
+- MinStock
+- UnitCost
+- UnitPrice
+- PromoMinQty
+- PromoUnitCost
 """)
 
     st.markdown("""
-## How supplier promotions are evaluated
+## Supplier promo logic
 
-If the supplier offers a lower price when you buy more stock, the app checks:
+If your supplier gives a better cost above a certain quantity, the app checks:
 
-- the standard reorder quantity
-- the minimum quantity needed for the promo
-- the discount gained
-- the estimated carrying cost of holding extra stock
+- normal reorder quantity
+- promo minimum quantity
+- expected savings from discount
+- estimated holding cost for the extra stock
 
-If the expected promo savings are larger than the holding cost of the extra stock, the app flags a **Promo Opportunity**.
-""")
-
-    st.markdown("""
-## Typical workflow
-
-1. Upload your latest SALES CSV  
-2. Optionally upload/update your PRODUCTS CSV  
-3. Review:
-   - low stock items
-   - suggested order quantities
-   - promo opportunities
-   - estimated stockout days  
-4. Download the reorder file and send it to your supplier
+If savings are higher than the holding cost, the app marks a **Promo Opportunity**.
 """)
 
     st.success("The user can read everything here inside the app. No separate PDF is required.")
+
+# =========================================================
+# USERS TAB (ADMIN ONLY)
+# =========================================================
+if tab_users is not None:
+    with tab_users:
+        st.subheader("👥 User Management (Admin)")
+
+        st.markdown("Create store accounts. Each account sees only its own data.")
+
+        with st.form("create_user_form"):
+            new_username = st.text_input("New username")
+            new_password = st.text_input("New password", type="password")
+            new_store_name = st.text_input("Store name")
+            new_role = st.selectbox("Role", ["user", "admin"], index=0)
+            create_btn = st.form_submit_button("Create user")
+
+            if create_btn:
+                if not new_username.strip() or not new_password.strip() or not new_store_name.strip():
+                    st.error("Συμπλήρωσε όλα τα πεδία.")
+                else:
+                    ok, msg = create_user(
+                        username=new_username,
+                        password=new_password,
+                        store_name=new_store_name,
+                        role=new_role
+                    )
+                    if ok:
+                        st.success("✅ User created.")
+                    else:
+                        st.error(msg)
+
+        st.divider()
+        st.markdown("### Existing users")
+        users_df = list_users()
+        st.dataframe(users_df, use_container_width=True)
+
+        st.divider()
+        st.markdown("### Delete user")
+        delete_candidates = users_df[users_df["id"] != user_id] if not users_df.empty else pd.DataFrame()
+
+        if delete_candidates.empty:
+            st.info("No deletable users available.")
+        else:
+            selected_delete_id = st.selectbox(
+                "Choose user id to delete",
+                options=delete_candidates["id"].tolist()
+            )
+            if st.button("🗑️ Delete selected user"):
+                delete_user(int(selected_delete_id))
+                st.success("✅ User deleted. Refresh if needed.")
