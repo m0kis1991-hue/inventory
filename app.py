@@ -56,7 +56,9 @@ def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
-    # Users
+    # -------------------------
+    # USERS TABLE
+    # -------------------------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,39 +71,56 @@ def init_db():
         )
     """)
 
-    # Sales per user
+    # -------------------------
+    # SALES TABLE (base create)
+    # -------------------------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sales (
-            user_id INTEGER NOT NULL,
             date TEXT NOT NULL,
             sku TEXT NOT NULL,
             quantity REAL NOT NULL,
-            stock REAL NOT NULL,
-            PRIMARY KEY (user_id, date, sku),
-            FOREIGN KEY (user_id) REFERENCES users(id)
+            stock REAL NOT NULL
         )
     """)
 
-    # Products per user
+    # migrate sales table if old version exists
+    cur.execute("PRAGMA table_info(sales)")
+    sales_cols = {row[1] for row in cur.fetchall()}
+
+    if "user_id" not in sales_cols:
+        cur.execute("ALTER TABLE sales ADD COLUMN user_id INTEGER DEFAULT 1")
+
+    # -------------------------
+    # PRODUCTS TABLE (base create)
+    # -------------------------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
-            user_id INTEGER NOT NULL,
-            sku TEXT NOT NULL,
+            sku TEXT PRIMARY KEY,
             product_name TEXT,
-            category TEXT,
-            supplier TEXT,
-            lead_time_override INTEGER,
-            days_to_cover_override INTEGER,
-            service_level_override INTEGER,
-            min_stock_override REAL,
-            unit_cost REAL,
-            unit_price REAL,
-            promo_min_qty REAL,
-            promo_unit_cost REAL,
-            PRIMARY KEY (user_id, sku),
-            FOREIGN KEY (user_id) REFERENCES users(id)
+            category TEXT
         )
     """)
+
+    # migrate products table if old version exists
+    cur.execute("PRAGMA table_info(products)")
+    product_cols = {row[1] for row in cur.fetchall()}
+
+    required_product_columns = {
+        "user_id": "INTEGER DEFAULT 1",
+        "supplier": "TEXT",
+        "lead_time_override": "INTEGER",
+        "days_to_cover_override": "INTEGER",
+        "service_level_override": "INTEGER",
+        "min_stock_override": "REAL",
+        "unit_cost": "REAL",
+        "unit_price": "REAL",
+        "promo_min_qty": "REAL",
+        "promo_unit_cost": "REAL"
+    }
+
+    for col_name, col_type in required_product_columns.items():
+        if col_name not in product_cols:
+            cur.execute(f"ALTER TABLE products ADD COLUMN {col_name} {col_type}")
 
     conn.commit()
     conn.close()
@@ -1239,3 +1258,4 @@ if tab_users is not None:
             if st.button("🗑️ Delete selected user"):
                 delete_user(int(selected_delete_id))
                 st.success("✅ User deleted. Refresh if needed.")
+
